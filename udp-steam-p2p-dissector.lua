@@ -156,7 +156,7 @@ local function dissect_unreliable(buffer, pinfo, tree)
     return true
 end
 
-local function validate_reliable_part(buffer, content_length, is_continuation)
+local function validate_reliable_message(buffer, content_length, is_continuation)
     if content_length < 2 and not is_continuation then
         return false
     end
@@ -164,9 +164,9 @@ local function validate_reliable_part(buffer, content_length, is_continuation)
     local buffer_length = buffer:len() -- NOTE: This *can* be zero i.e. we're a fragment with *zero* data.
 
     if not is_continuation and buffer_length > 0 then
-        local part_has_channel = buffer(0, 1)
+        local message_has_channel = buffer(0, 1)
 
-        if part_has_channel:int() == 1 and content_length < 6 then
+        if message_has_channel:int() == 1 and content_length < 6 then
             return false
         end
     end
@@ -175,7 +175,7 @@ local function validate_reliable_part(buffer, content_length, is_continuation)
 end
 
 -- fragment_length: is_fragment_continuation ? int : buffer slice
-local function dissect_reliable_part(tree, buffer, message_length, is_fragment_continuation)
+local function dissect_reliable_message(tree, buffer, message_length, is_fragment_continuation)
     local data_offset = 0
     local buffer_length = buffer:len()
 
@@ -184,12 +184,12 @@ local function dissect_reliable_part(tree, buffer, message_length, is_fragment_c
     end
 
     if not is_fragment_continuation and buffer_length > 0 then
-        local part_has_channel = buffer(0, 1)
-        tree:add(steamp2p_protocol.fields.has_channel, part_has_channel, part_has_channel:int() == 1)
+        local message_has_channel = buffer(0, 1)
+        tree:add(steamp2p_protocol.fields.has_channel, message_has_channel, message_has_channel:int() == 1)
 
         data_offset = data_offset + 1
 
-        if part_has_channel and part_has_channel:int() == 1 then
+        if message_has_channel and message_has_channel:int() == 1 then
             local channel = buffer(1, 4)
             tree:add(steamp2p_protocol.fields.channel, channel, channel:le_int())
             data_offset = data_offset + 4
@@ -198,11 +198,11 @@ local function dissect_reliable_part(tree, buffer, message_length, is_fragment_c
 
     local length = is_fragment_continuation and message_length or message_length:uint()
     local remaining_data_length = length - data_offset
-    local part_data_length = math.min(remaining_data_length, buffer_length - data_offset)
-    local data = part_data_length > 0 and buffer(data_offset, part_data_length):tvb() or nil
+    local message_data_length = math.min(remaining_data_length, buffer_length - data_offset)
+    local data = message_data_length > 0 and buffer(data_offset, message_data_length):tvb() or nil
 
-    local post_part_remaining_data_length = remaining_data_length - part_data_length
-    local is_fragment = is_fragment_continuation or post_part_remaining_data_length > 0
+    local post_message_remaining_data_length = remaining_data_length - message_data_length
+    local is_fragment = is_fragment_continuation or post_message_remaining_data_length > 0
 
     if is_fragment then
         if is_fragment_continuation then
@@ -211,7 +211,7 @@ local function dissect_reliable_part(tree, buffer, message_length, is_fragment_c
             tree:add(steamp2p_protocol.fields.data_length, remaining_data_length):set_generated()
         end
 
-        tree:add(steamp2p_protocol.fields.fragment_data_length, part_data_length):set_generated()
+        tree:add(steamp2p_protocol.fields.fragment_data_length, message_data_length):set_generated()
 
         if data then
             tree:add(steamp2p_protocol.fields.fragment_data, data())
@@ -221,7 +221,7 @@ local function dissect_reliable_part(tree, buffer, message_length, is_fragment_c
         tree:add(steamp2p_protocol.fields.data, data())
     end
 
-    return post_part_remaining_data_length
+    return post_message_remaining_data_length
 end
 
 local function dissect_time(time)
@@ -238,41 +238,45 @@ local CONTENT_DISSECTORS = {
         end
 
         local continuation_remaining_length = fragmented_packets[sequence_sent] or 0
-        local is_continuation_fragment = continuation_remaining_length > 0
+        local is_fragment_continuation_packet = continuation_remaining_length > 0
 
-        local remaining_data_length = 0
-        local packet_size = is_continuation_fragment and continuation_remaining_length or buffer(0, 4)
-        local packet_size_i = is_continuation_fragment and continuation_remaining_length or packet_size:uint()
+        local message_remaining_data_length = 0
+        local packet_size = is_fragment_continuation_packet and continuation_remaining_length or buffer(0, 4)
+        local packet_size_i = is_fragment_continuation_packet and continuation_remaining_length or packet_size:uint()
 
         if packet_size_i >= length - 4 then
-            local is_fragment_continuation = is_continuation_fragment
-            local content_offset = not is_fragment_continuation and 4 or 0
+            local content_offset = not is_fragment_continuation_packet and 4 or 0
             local content = buffer(content_offset):tvb()
-
-            remaining_data_length = dissect_reliable_part(tree, content, packet_size, is_fragment_continuation)
-        else -- Multi-part
+            message_remaining_data_length = dissect_reliable_message(tree, content, packet_size, is_fragment_continuation_packet)
+        else -- Multiple messages
             local index = 1
             local offset = 0
 
             while offset < length do
-                local part_tree = tree:add(steamp2p_protocol, buffer(), "Part #" .. index)
+                local is_continuation_message = index == 1 and is_fragment_continuation_packet
+                local message_tree = tree:add(steamp2p_protocol, buffer(), "Message #" .. index)
 
-                local is_continuation_part = index == 1 and is_continuation_fragment
-                local part_content_size = is_continuation_part and continuation_remaining_length or buffer(offset, 4)
-                local part_content_size_i = is_continuation_part and part_content_size or part_content_size:uint()
-                local part_content_offset = offset + (not is_continuation_part and 4 or 0)
-                local content = buffer(part_content_offset):tvb()
+                local message_content_size = is_continuation_message and continuation_remaining_length or buffer(offset, 4)
+                local message_content_size_i = is_continuation_message and message_content_size or message_content_size:uint()
+                local message_content_offset = offset + (not is_continuation_message and 4 or 0)
+                local content = buffer(message_content_offset):tvb()
 
-                remaining_data_length = dissect_reliable_part(part_tree, content, part_content_size, is_continuation_part)
+                message_remaining_data_length = dissect_reliable_message(message_tree, content, message_content_size, is_continuation_message)
 
-                offset = part_content_offset + part_content_size_i
+                if is_continuation_message then
+                    message_tree:append_text(" (Final Fragment)")
+                elseif message_remaining_data_length > 0 then
+                    message_tree:append_text(" (Fragmented)")
+                end
+
+                offset = message_content_offset + message_content_size_i
                 index = index + 1
             end
         end
 
-        if remaining_data_length > 0 then
+        if message_remaining_data_length > 0 then
             local next_sequence_sent = sequence_sent + length
-            fragmented_packets[next_sequence_sent] = remaining_data_length
+            fragmented_packets[next_sequence_sent] = message_remaining_data_length
         end
     end,
     [PACKET_TYPE_COMMAND] = function(buffer, tree)
@@ -294,30 +298,30 @@ local CONTENT_VALIDATORS = {
         end
 
         local continuation_remaining_length = fragmented_packets[sequence_sent] or 0
-        local is_continuation_fragment = continuation_remaining_length > 0
+        local is_fragment_continuation_packet = continuation_remaining_length > 0
 
-        local size = is_continuation_fragment and continuation_remaining_length or buffer(offset, 4):uint()
+        local size = is_fragment_continuation_packet and continuation_remaining_length or buffer(offset, 4):uint()
 
         if size >= length - 4 then
-            local content_offset = not is_continuation_fragment and 4 or 0
+            local content_offset = not is_fragment_continuation_packet and 4 or 0
 
-            if not validate_reliable_part(buffer(content_offset):tvb(), size, is_continuation_fragment) then
+            if not validate_reliable_message(buffer(content_offset):tvb(), size, is_fragment_continuation_packet) then
                 return false
             end
-        else -- Multi-part
+        else -- Multiple messages
             local index = 1
             local offset = 0
 
             while offset < length do
-                local is_continuation_part = index == 1 and is_continuation_fragment
-                local part_content_size = is_continuation_part and continuation_remaining_length or buffer(offset, 4):uint()
-                local part_content_offset = offset + (not is_continuation_part and 4 or 0)
+                local is_continuation_message = index == 1 and is_fragment_continuation_packet
+                local message_content_size = is_continuation_message and continuation_remaining_length or buffer(offset, 4):uint()
+                local message_content_offset = offset + (not is_continuation_message and 4 or 0)
 
-                if not validate_reliable_part(buffer(part_content_offset):tvb(), part_content_size, is_continuation_part) then
+                if not validate_reliable_message(buffer(message_content_offset):tvb(), message_content_size, is_continuation_message) then
                     return false
                 end
 
-                offset = part_content_offset + part_content_size
+                offset = message_content_offset + message_content_size
                 index = index + 1
             end
         end
