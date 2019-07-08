@@ -1,4 +1,4 @@
-local TYPE_STRINGIFIERS = {
+TYPE_STRINGIFIERS = {
     ['nil'] = function(v) return 'nil' end,
     boolean = function(v) return tostring(v) end,
     number = function(v) return v end,
@@ -9,42 +9,47 @@ local TYPE_STRINGIFIERS = {
     table = function(v) return tostring(v) end,
 }
 
---- Returns true if `tab` contains an entry at index 1. If so, we *assume* `tab` is a simple array (only contains sequential positive integer keys).
-local function is_array(tab)
-    return tab[1] ~= nil
-end
-
-local function dump_table(tab, recursive, depth)
+function dump_table(tab, recursive, depth)
     depth = depth or 1
 
     local indentation = string.rep('  ', depth)
-    local string = '{'
+    local str = '{'
+    local ordered_keys = {}
 
-    if is_array(tab) then
-        for i, v in ipairs(tab) do
-            string = string .. '\n' .. indentation .. '[' .. i .. '] = '
+    for i, v in ipairs(tab) do
+        ordered_keys[i] = true
+        str = str .. '\n' .. indentation .. '[' .. i .. '] = '
 
-            if recursive and type(v) == 'table' then
-                string = string .. dump_table(v, true, depth + 1) .. ','
-            else
-                string = string .. TYPE_STRINGIFIERS[type(v)](v) .. ','
-            end
+        if recursive and type(v) == 'table' then
+            str = str .. dump_table(v, true, depth + 1) .. ','
+        else
+            str = str .. TYPE_STRINGIFIERS[type(v)](v) .. ','
         end
-    else
-        for k, v in pairs(tab) do
-            string = string .. '\n' .. indentation .. '[' .. TYPE_STRINGIFIERS[type(k)](k) .. '] = '
+    end
+
+    for k, v in pairs(tab) do
+        if not ordered_keys[k] then
+            str = str .. '\n' .. indentation .. '[' .. TYPE_STRINGIFIERS[type(k)](k) .. '] = '
 
             if recursive and type(v) == 'table' then
-                string = string .. dump_table(v, true, depth + 1) .. ','
+                str = str .. dump_table(v, true, depth + 1) .. ','
             else
-                string = string .. TYPE_STRINGIFIERS[type(v)](v) .. ','
+                str = str .. TYPE_STRINGIFIERS[type(v)](v) .. ','
             end
         end
     end
 
-    string = string .. '\n' .. string.rep('  ', depth - 1) .. '}'
+    str = str .. '\n' .. string.rep('  ', depth - 1) .. '}'
 
-    return string
+    return str
+end
+
+function dump(v, recursive)
+    if type(v) == 'table' then
+        return dump_table(v, recursive, 1)
+    else
+        return TYPE_STRINGIFIERS[type(v)](v)
+    end
 end
 
 -- Diagnostics table
@@ -174,7 +179,7 @@ local function validate_reliable_message(buffer, content_length, is_continuation
     return true
 end
 
--- fragment_length: is_fragment_continuation ? int : buffer slice
+-- message_length: is_fragment_continuation ? int : buffer slice
 local function dissect_reliable_message(tree, buffer, message_length, is_fragment_continuation)
     local data_offset = 0
     local buffer_length = buffer:len()
