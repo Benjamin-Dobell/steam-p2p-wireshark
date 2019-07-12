@@ -84,7 +84,7 @@ steamp2p_protocol.fields.receive_buffer_size = ProtoField.new("Receive Buffer Si
 steamp2p_protocol.fields.time_sent = ProtoField.new("Time Sent", "steamp2p.time_sent", ftypes.RELATIVE_TIME)
 steamp2p_protocol.fields.time_received = ProtoField.new("Time Received", "steamp2p.time_received", ftypes.RELATIVE_TIME)
 steamp2p_protocol.fields.message_length = ProtoField.new("Message Length", "steamp2p.message_length", ftypes.INT32, nil, base.DEC)
-steamp2p_protocol.fields.remaining_data_length = ProtoField.new("Remaining Data Length", "steamp2p.remaining_data_length", ftypes.INT32, nil, base.DEC)
+steamp2p_protocol.fields.outstanding_data_length = ProtoField.new("Outstanding Data Length", "steamp2p.outstanding_data_length", ftypes.INT32, nil, base.DEC)
 steamp2p_protocol.fields.fragment_data = ProtoField.new("Fragment Data", "steamp2p.data", ftypes.BYTES, nil, base.NONE)
 steamp2p_protocol.fields.fragment_data_length = ProtoField.new("Fragment Data Length", "steamp2p.fragment_data_length", ftypes.UINT32, nil, base.DEC)
 steamp2p_protocol.fields.command = ProtoField.new("Command", "steamp2p.command", ftypes.UINT8, nil, base.HEX)
@@ -100,7 +100,78 @@ local PACKET_TYPE_DESCRIPTIONS = {
     [PACKET_TYPE_COMMAND] = '(Command)'
 }
 
-local fragmented_packets = {} -- Indexed by sequence_sent, value is remaining bytes in fragment
+-- SteamP2P is just awfully designed and ridiculously stateful. You can't even parse a reliable packet without already parsed every prior packet!
+local connections = {} -- Indexed by { ["source_ip:destination_ip"] = { [sequence_sent] = { [frame] = packet_info } } }
+
+local function get_previous_packet(frame, source_ip, destination_ip, sequence_number)
+    local connection_fragments = connections[source_ip .. ":" .. destination_ip]
+
+    if connection_fragments then
+        local sequence_number_fragments = connection_fragments[sequence_number]
+
+        if sequence_number_fragments then
+            -- We may start and close multiple connections with the same client, so we do our best to look-up the correct value, it's not perfect though!
+            local past_match
+            local future_match
+
+            for candidate_frame, candidate in pairs(sequence_number_fragments) do
+                if candidate_frame < frame and (past_match == nil or candidate_frame > past_match.frame) then
+                    past_match = candidate
+                end
+
+                if candidate_frame > frame and (future_match == nil or candidate_frame < future_match.frame) then
+                    future_match = candidate
+                end
+            end
+
+            if past_match then
+                if future_match then
+                    local past_distance = frame - past_match.frame
+                    local future_distance = future_match.frame - frame
+
+                    -- Typically, we'll be a continuation of a frame that arrived before us. However, packets can arrive out of order, so we'll prefer frames
+                    -- prior, but consider frames after if they're substantially "closer" to us.
+                    if future_distance < past_distance / 3 then
+                        return future_match
+                    else
+                        return past_match
+                    end
+                else
+                    return past_match
+                end
+            elseif future_match then
+                return future_match
+            end
+        end
+    end
+
+    return nil
+end
+
+local function set_previous_packet(frame, source_ip, destination_ip, sequence_number, outstanding_length)
+    local connection_key = source_ip .. ":" .. destination_ip
+    local connection = connections[connection_key]
+
+    if not connection then
+        connection = {}
+        connections[connection_key] = connection
+    end
+
+    local sequence_number_packets = connection[sequence_number]
+
+    if not sequence_number_packets then
+        sequence_number_packets = {}
+        connection[sequence_number] = sequence_number_packets
+    end
+
+    local packet = {
+        frame = frame,
+        outstanding_length = outstanding_length,
+        sequence_number = sequence_number,
+    }
+
+    sequence_number_packets[packet.frame] = packet
+end
 
 local function steamp2p_subtree(tree, buffer)
     return tree:add(steamp2p_protocol, buffer(), "Steam P2P")
@@ -161,80 +232,87 @@ local function dissect_unreliable(buffer, pinfo, tree)
     return true
 end
 
-local function validate_reliable_message(buffer, content_length, is_continuation)
-    if content_length < 2 and not is_continuation then
-        return false
-    end
-
-    local buffer_length = buffer:len() -- NOTE: This *can* be zero i.e. we're a fragment with *zero* data.
-
-    if not is_continuation and buffer_length > 0 then
-        local message_has_channel = buffer(0, 1)
-
-        if message_has_channel:int() == 1 and content_length < 6 then
-            return false
-        end
-    end
-
-    return true
-end
-
--- message_length: is_fragment_continuation ? int : buffer slice
-local function dissect_reliable_message(tree, buffer, message_length, is_fragment_continuation)
-    local data_offset = 0
-    local buffer_length = buffer:len()
-
-    if not is_fragment_continuation then
-        tree:add(steamp2p_protocol.fields.message_length, message_length)
-    end
-
-    if not is_fragment_continuation and buffer_length > 0 then
-        local message_has_channel = buffer(0, 1)
-        tree:add(steamp2p_protocol.fields.has_channel, message_has_channel, message_has_channel:int() == 1)
-
-        data_offset = data_offset + 1
-
-        if message_has_channel and message_has_channel:int() == 1 then
-            local channel = buffer(1, 4)
-            tree:add(steamp2p_protocol.fields.channel, channel, channel:le_int())
-            data_offset = data_offset + 4
-        end
-    end
-
-    local length = is_fragment_continuation and message_length or message_length:uint()
-    local remaining_data_length = length - data_offset
-    local message_data_length = math.min(remaining_data_length, buffer_length - data_offset)
-    local data = message_data_length > 0 and buffer(data_offset, message_data_length):tvb() or nil
-
-    local post_message_remaining_data_length = remaining_data_length - message_data_length
-    local is_fragment = is_fragment_continuation or post_message_remaining_data_length > 0
-
-    if is_fragment then
-        if is_fragment_continuation then
-            tree:add(steamp2p_protocol.fields.remaining_data_length, remaining_data_length):set_generated()
-        else
-            tree:add(steamp2p_protocol.fields.data_length, remaining_data_length):set_generated()
-        end
-
-        tree:add(steamp2p_protocol.fields.fragment_data_length, message_data_length):set_generated()
-
-        if data then
-            tree:add(steamp2p_protocol.fields.fragment_data, data())
-        end
-    else
-        tree:add(steamp2p_protocol.fields.data_length, remaining_data_length):set_generated()
-        tree:add(steamp2p_protocol.fields.data, data())
-    end
-
-    return post_message_remaining_data_length
-end
-
 local function dissect_time(time)
     return NSTime(time:uint() / 1000, (time:uint() % 1000) * 1000000)
 end
 
-local CONTENT_DISSECTORS = {
-    [PACKET_TYPE_DATA] = function(buffer, tree, sequence_sent)
+local function parse_reliable_data_message(buffer)
+    local length = buffer:len()
+
+    if length < 5 then
+        return nil
+    end
+
+    local message_length = buffer(0, 4)
+    local has_channel = buffer(4, 1)
+
+    local message = {
+        message_length = message_length:uint(),
+        has_channel = has_channel:int() == 1,
+        _ranges = {
+            message_length = message_length,
+            has_channel = has_channel,
+        }
+    }
+
+    if message.has_channel then
+        if buffer:len() < 9 then
+            return nil
+        end
+
+        local channel = buffer(5, 4)
+
+        message.channel = channel:le_int()
+        message._ranges.channel = channel
+    end
+
+    message._header_length = message.has_channel and 9 or 5
+    message._data_length = message.message_length - (message._header_length - 4)
+
+    return message
+end
+
+local unparsed = {}
+
+local function quick_parse(frame, source_ip, destination_ip, buffer, sequence_sent)
+    local length = buffer:len()
+    local previous_packet = get_previous_packet(frame, source_ip, destination_ip, sequence_sent)
+
+    if not previous_packet then
+        return false
+    end
+
+    local offset = 0
+    local index = 1
+
+    while offset < length do
+        if index == 1 and previous_packet.outstanding_length > 0 then
+            -- Fragment (message continuation)
+            offset = offset + previous_packet.outstanding_length
+        else
+            local message = parse_reliable_data_message(buffer(offset):tvb())
+            offset = offset + message._header_length + message._data_length
+        end
+
+        index = index + 1
+    end
+
+    local next_sequence_sent = sequence_sent + length
+    local outstanding = offset - length
+    set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding)
+
+    unparsed[sequence_sent] = nil
+
+    local unparsed_next_packet = unparsed[next_sequence_sent]
+
+    if unparsed_next_packet then
+        local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
+        quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
+    end
+end
+
+CONTENT_DISSECTORS = {
+    [PACKET_TYPE_DATA] = function(buffer, pinfo, tree, sequence_sent)
         local length = buffer:len()
 
         if length == 0 then
@@ -242,56 +320,120 @@ local CONTENT_DISSECTORS = {
             return -- ACK
         end
 
-        local continuation_remaining_length = fragmented_packets[sequence_sent] or 0
-        local is_fragment_continuation_packet = continuation_remaining_length > 0
+        local frame = pinfo.number
+        local source_ip = tostring(pinfo.src)
+        local destination_ip = tostring(pinfo.dst)
 
-        local message_remaining_data_length = 0
-        local packet_size = is_fragment_continuation_packet and continuation_remaining_length or buffer(0, 4)
-        local packet_size_i = is_fragment_continuation_packet and continuation_remaining_length or packet_size:uint()
+        local previous_packet = get_previous_packet(frame, source_ip, destination_ip, sequence_sent)
 
-        if packet_size_i >= length - 4 then
-            local content_offset = not is_fragment_continuation_packet and 4 or 0
-            local content = buffer(content_offset):tvb()
-            message_remaining_data_length = dissect_reliable_message(tree, content, packet_size, is_fragment_continuation_packet)
-        else -- Multiple messages
-            local index = 1
-            local offset = 0
+        if not previous_packet then
+            unparsed[sequence_sent] = {frame, source_ip, destination_ip, buffer:bytes(), sequence_sent}
+            return false-- We need the previous packet before we can progress
+        end
 
-            while offset < length do
-                local is_continuation_message = index == 1 and is_fragment_continuation_packet
-                local message_tree = tree:add(steamp2p_protocol, buffer(), "Message #" .. index)
+        local offset = 0
+        local index = 1
 
-                local message_content_size = is_continuation_message and continuation_remaining_length or buffer(offset, 4)
-                local message_content_size_i = is_continuation_message and message_content_size or message_content_size:uint()
-                local message_content_offset = offset + (not is_continuation_message and 4 or 0)
-                local content = buffer(message_content_offset):tvb()
+        while offset < length do
+            local message_tree = tree:add(steamp2p_protocol, buffer(), "Message #" .. index)
 
-                message_remaining_data_length = dissect_reliable_message(message_tree, content, message_content_size, is_continuation_message)
+            if index == 1 and previous_packet.outstanding_length > 0 then
+                 -- Fragment (message continuation)
+                local available_data_length = math.min(previous_packet.outstanding_length, length - offset)
 
-                if is_continuation_message then
+                tree:add(steamp2p_protocol.fields.fragment_data_length, available_data_length):set_generated()
+                tree:add(steamp2p_protocol.fields.fragment_data, buffer(offset, available_data_length))
+
+                if available_data_length == previous_packet.outstanding_length then
                     message_tree:append_text(" (Final Fragment)")
-                elseif message_remaining_data_length > 0 then
-                    message_tree:append_text(" (Fragmented)")
+                else
+                    message_tree:append_text(" (Fragment)")
+                    tree:add(steamp2p_protocol.fields.outstanding_data_length, previous_packet.outstanding_length - available_data_length):set_generated()
                 end
 
-                offset = message_content_offset + message_content_size_i
-                index = index + 1
+                offset = offset + previous_packet.outstanding_length
+            else
+                local message = parse_reliable_data_message(buffer(offset):tvb())
+
+                tree:add(steamp2p_protocol.fields.message_length, message._ranges.message_length, message.message_length)
+                tree:add(steamp2p_protocol.fields.has_channel, message._ranges.has_channel, message.has_channel)
+
+                if message.has_channel then
+                    tree:add(steamp2p_protocol.fields.channel, message._ranges.channel, message.channel)
+                end
+
+                tree:add(steamp2p_protocol.fields.data_length, message._data_length):set_generated()
+
+                local available_data_length = math.min(message._data_length, length - offset - message._header_length)
+
+                if message._data_length > 0 then
+                    local data_field
+
+                    if available_data_length == message._data_length then
+                        data_field = steamp2p_protocol.fields.data
+                    else
+                        data_field = steamp2p_protocol.fields.fragment_data
+                        tree:add(steamp2p_protocol.fields.fragment_data_length, available_data_length):set_generated()
+                    end
+
+                    tree:add(data_field, buffer(offset + message._header_length, available_data_length))
+
+                    if available_data_length ~= message._data_length then
+                        message_tree:append_text(" (Initial Fragment)")
+                        tree:add(steamp2p_protocol.fields.outstanding_data_length, message._data_length - available_data_length):set_generated()
+                    end
+                end
+
+                offset = offset + message._header_length + message._data_length
             end
+
+            index = index + 1
         end
 
-        if message_remaining_data_length > 0 then
-            local next_sequence_sent = sequence_sent + length
-            fragmented_packets[next_sequence_sent] = message_remaining_data_length
+        local next_sequence_sent = sequence_sent + length
+        local outstanding = offset - length
+
+        local frame = pinfo.number
+        local source_ip = tostring(pinfo.src)
+        local destination_ip = tostring(pinfo.dst)
+
+        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding)
+
+        unparsed[sequence_sent] = nil
+
+        local unparsed_next_packet = unparsed[next_sequence_sent]
+
+        if unparsed_next_packet then
+            local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
+            quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
         end
+
+        return true
     end,
-    [PACKET_TYPE_COMMAND] = function(buffer, tree)
-        local command = buffer(offset, 1)
+    [PACKET_TYPE_COMMAND] = function(buffer, pinfo, tree, sequence_sent)
+        local command = buffer(0, 1)
         tree:add(steamp2p_protocol.fields.command, command)
+
+        local length = buffer:len()
+        local next_sequence_sent = sequence_sent + length
+
+        local frame = pinfo.number
+        local source_ip = tostring(pinfo.src)
+        local destination_ip = tostring(pinfo.dst)
+
+        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, 0)
+
+        local unparsed_next_packet = unparsed[next_sequence_sent]
+
+        if unparsed_next_packet then
+            local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
+            quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
+        end
     end,
 }
 
 local CONTENT_VALIDATORS = {
-    [PACKET_TYPE_DATA] = function(buffer, sequence_sent)
+    [PACKET_TYPE_DATA] = function(buffer, pinfo, sequence_sent)
         local length = buffer:len()
 
         if length == 0 then
@@ -302,38 +444,9 @@ local CONTENT_VALIDATORS = {
             return false
         end
 
-        local continuation_remaining_length = fragmented_packets[sequence_sent] or 0
-        local is_fragment_continuation_packet = continuation_remaining_length > 0
-
-        local size = is_fragment_continuation_packet and continuation_remaining_length or buffer(offset, 4):uint()
-
-        if size >= length - 4 then
-            local content_offset = not is_fragment_continuation_packet and 4 or 0
-
-            if not validate_reliable_message(buffer(content_offset):tvb(), size, is_fragment_continuation_packet) then
-                return false
-            end
-        else -- Multiple messages
-            local index = 1
-            local offset = 0
-
-            while offset < length do
-                local is_continuation_message = index == 1 and is_fragment_continuation_packet
-                local message_content_size = is_continuation_message and continuation_remaining_length or buffer(offset, 4):uint()
-                local message_content_offset = offset + (not is_continuation_message and 4 or 0)
-
-                if not validate_reliable_message(buffer(message_content_offset):tvb(), message_content_size, is_continuation_message) then
-                    return false
-                end
-
-                offset = message_content_offset + message_content_size
-                index = index + 1
-            end
-        end
-
         return true
     end,
-    [PACKET_TYPE_COMMAND] = function(buffer, sequence_sent)
+    [PACKET_TYPE_COMMAND] = function(buffer)
         return buffer:len() > 0
     end,
 }
@@ -375,7 +488,7 @@ local function dissect_reliable(buffer, pinfo, tree)
     local content = buffer(RELIABLE_PACKET_HEADER_SIZE)
     local validator = CONTENT_VALIDATORS[packet_type:uint()]
 
-    if validator and not validator(content, sequence_sent:uint(), sequence_received:uint()) then
+    if validator and not validator(content, pinfo, sequence_sent:uint(), sequence_received:uint()) then
         return false
     end
 
@@ -395,7 +508,7 @@ local function dissect_reliable(buffer, pinfo, tree)
     local content_dissector = CONTENT_DISSECTORS[packet_type:uint()]
 
     if content_dissector then
-        content_dissector(content, subtree, sequence_sent:uint(), sequence_received:uint())
+        content_dissector(content, pinfo, subtree, sequence_sent:uint(), sequence_received:uint())
     end
 
     return true
