@@ -192,7 +192,7 @@ local function dissect_unreliable(buffer, pinfo, tree)
     end
 
     local has_channel = buffer(1, 1)
-    local data_index = 1
+    local data_index = 2
     local channel
 
     if has_channel:int() == 1 then
