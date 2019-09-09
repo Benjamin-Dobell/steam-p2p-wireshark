@@ -148,7 +148,7 @@ local function get_previous_packet(frame, source_ip, destination_ip, sequence_nu
     return nil
 end
 
-local function set_previous_packet(frame, source_ip, destination_ip, sequence_number, outstanding_length)
+local function set_previous_packet(frame, source_ip, destination_ip, sequence_number, outstanding_length, parsed_out_of_order)
     local connection_key = source_ip .. ":" .. destination_ip
     local connection = connections[connection_key]
 
@@ -168,6 +168,7 @@ local function set_previous_packet(frame, source_ip, destination_ip, sequence_nu
         frame = frame,
         outstanding_length = outstanding_length,
         sequence_number = sequence_number,
+        parsed_out_of_order = parsed_out_of_order,
     }
 
     sequence_number_packets[packet.frame] = packet
@@ -272,7 +273,7 @@ local function parse_reliable_data_message(buffer)
     return message
 end
 
-local unparsed = {}
+local parsed_unordered = {}
 
 local function quick_parse(frame, source_ip, destination_ip, buffer, sequence_sent)
     local length = buffer:len()
@@ -299,14 +300,14 @@ local function quick_parse(frame, source_ip, destination_ip, buffer, sequence_se
 
     local next_sequence_sent = sequence_sent + length
     local outstanding = offset - length
-    set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding)
+    set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding, false)
 
-    unparsed[sequence_sent] = nil
+    parsed_unordered[sequence_sent] = nil
 
-    local unparsed_next_packet = unparsed[next_sequence_sent]
+    local out_of_order_next_packet = parsed_unordered[next_sequence_sent]
 
-    if unparsed_next_packet then
-        local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
+    if out_of_order_next_packet then
+        local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(out_of_order_next_packet)
         quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
     end
 end
@@ -325,18 +326,21 @@ CONTENT_DISSECTORS = {
         local destination_ip = tostring(pinfo.dst)
 
         local previous_outstanding_length
+        local parsed_out_of_order = false
 
         if sequence_sent == 0 then
             previous_outstanding_length = 0
         else
             local previous_packet = get_previous_packet(frame, source_ip, destination_ip, sequence_sent)
 
-            if not previous_packet then
-                unparsed[sequence_sent] = {frame, source_ip, destination_ip, buffer:bytes(), sequence_sent}
-                return -- We need the previous packet before we can progress
+            if previous_packet then
+                previous_outstanding_length = previous_packet.outstanding_length
+                parsed_out_of_order = previous_packet.parsed_out_of_order
+            else
+                previous_outstanding_length = 0
+                parsed_unordered[sequence_sent] = { frame, source_ip, destination_ip, buffer:bytes(), sequence_sent}
+                parsed_out_of_order = true
             end
-
-            previous_outstanding_length = previous_packet.outstanding_length
         end
 
         local offset = 0
@@ -405,15 +409,17 @@ CONTENT_DISSECTORS = {
         local source_ip = tostring(pinfo.src)
         local destination_ip = tostring(pinfo.dst)
 
-        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding)
+        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, outstanding, parsed_out_of_order)
 
-        unparsed[sequence_sent] = nil
+        if not parsed_out_of_order then
+            parsed_unordered[sequence_sent] = nil
 
-        local unparsed_next_packet = unparsed[next_sequence_sent]
+            local unparsed_next_packet = parsed_unordered[next_sequence_sent]
 
-        if unparsed_next_packet then
-            local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
-            quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
+            if unparsed_next_packet then
+                local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
+                quick_parse(frame, source_ip, destination_ip, bytes:tvb(), sequence_sent)
+            end
         end
     end,
     [PACKET_TYPE_COMMAND] = function(buffer, pinfo, tree, sequence_sent)
@@ -427,9 +433,9 @@ CONTENT_DISSECTORS = {
         local source_ip = tostring(pinfo.src)
         local destination_ip = tostring(pinfo.dst)
 
-        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, 0)
+        set_previous_packet(frame, source_ip, destination_ip, next_sequence_sent, 0, false)
 
-        local unparsed_next_packet = unparsed[next_sequence_sent]
+        local unparsed_next_packet = parsed_unordered[next_sequence_sent]
 
         if unparsed_next_packet then
             local frame, source_ip, destination_ip, bytes, sequence_sent = table.unpack(unparsed_next_packet)
