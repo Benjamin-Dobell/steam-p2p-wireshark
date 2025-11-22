@@ -234,7 +234,7 @@ local function dissect_unreliable(buffer, pinfo, tree)
 end
 
 local function dissect_time(time)
-    return NSTime(time:uint() / 1000, (time:uint() % 1000) * 1000000)
+    return NSTime(math.round(time:uint() / 1000), (time:uint() % 1000) * 1000000)
 end
 
 local function parse_reliable_data_message(buffer)
